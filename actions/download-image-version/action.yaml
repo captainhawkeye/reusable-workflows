@@ -1,0 +1,107 @@
+name: 'Download Docker Image Version from Google Cloud Storage Bucket'
+description: 'A reusable action to download docker image version from Google Cloud Storage Bucket using Workload Identity Federation'
+inputs:
+  workload-identity-provider:
+    description: 'The full identifier of the Workload Identity Provider, including the project number, pool name, and provider name'
+    required: true
+  service-account:
+    description: 'Email address of the Google Cloud Service Account to impersonate'
+    required: true
+  bucket-name:
+    description: 'Name of the Google Cloud Storage bucket to upload the image version information'
+    required: true
+  bucket-path:
+    description: 'Path within the Google Cloud Storage bucket where the image version information will be stored'
+    required: true
+  docker-registry:
+    description: 'Docker registry URL (e.g., gcr.io, ghcr.io)'
+    required: false
+  docker-repo:
+    description: 'Docker repository name (e.g., icp-tenant-ui, my-app)'
+    required: false
+runs:
+  using: 'composite'
+  steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        service_account: ${{ inputs.service-account }}
+        token_format: access_token
+        access_token_lifetime: 300s
+    
+    - name: Fetch Image Version from GCP Bucket
+      id: fetch-version
+      shell: bash
+      run: |
+        GCP_PROJECT=$(gcloud config get-value project)
+        echo "Using GCP project: $GCP_PROJECT"
+        
+        BUCKET_NAME="${{ inputs.bucket-name }}"
+        VERSION_FILE="${{ inputs.bucket-path }}/latest-version.json"
+        
+        echo "📥 Fetching latest version info from gs://${BUCKET_NAME}/${VERSION_FILE}"
+        
+        if ! gcloud storage buckets describe gs://${BUCKET_NAME} --project=$GCP_PROJECT &>/dev/null; then
+          echo "❌ Bucket gs://${BUCKET_NAME} does not exist in project $GCP_PROJECT!"
+          echo "Please ensure the build workflow has run successfully at least once."
+          exit 1
+        fi
+        
+        MAX_RETRIES=3
+        RETRY_COUNT=0
+        DOWNLOAD_SUCCESS=false
+        
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DOWNLOAD_SUCCESS" != "true" ]; do
+          if gcloud storage cp gs://${BUCKET_NAME}/${VERSION_FILE} ./version_info.json \
+               --project=$GCP_PROJECT &>/dev/null; then
+            DOWNLOAD_SUCCESS=true
+          else
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "⚠️ Download attempt $RETRY_COUNT failed. Retrying in 5 seconds..."
+              sleep 5
+            fi
+          fi
+        done
+        
+        if [ "$DOWNLOAD_SUCCESS" != "true" ]; then
+          echo "❌ Failed to download version info after $MAX_RETRIES attempts."
+          echo "Please verify that file gs://${BUCKET_NAME}/${VERSION_FILE} exists and is accessible."
+          exit 1
+        fi
+        
+        if ! jq '.' version_info.json >/dev/null 2>&1; then
+          echo "❌ Downloaded file is not valid JSON."
+          echo "Content of the file:"
+          cat version_info.json
+          exit 1
+        fi
+        
+        IMAGE_VERSION=$(jq -r '.version' version_info.json)
+        COMMIT=$(jq -r '.commit' version_info.json)
+        TIMESTAMP=$(jq -r '.timestamp' version_info.json)
+        WORKFLOW_ID=$(jq -r '.workflow_id' version_info.json)
+        
+        if [ -z "$IMAGE_VERSION" ] || [ "$IMAGE_VERSION" = "null" ]; then
+          echo "❌ Failed to extract image version from file."
+          echo "Content of version_info.json:"
+          cat version_info.json
+          exit 1
+        fi
+        
+        echo "IMAGE_VERSION=$IMAGE_VERSION" >> $GITHUB_ENV
+        echo "IMAGE_COMMIT=$COMMIT" >> $GITHUB_ENV
+        echo "IMAGE_TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+        
+        echo "✅ Retrieved image version: $IMAGE_VERSION"
+        echo "  • Built at: $TIMESTAMP"
+        echo "  • From commit: $COMMIT"
+        echo "  • Workflow ID: $WORKFLOW_ID"
+
+        if [ -n "${{ inputs.docker-registry }}" ] && [ -n "${{ inputs.docker-repo }}" ]; then
+          FULL_IMAGE_REF="${{ inputs.docker-registry }}/${{ inputs.docker-repo }}:$IMAGE_VERSION"
+          echo "🚀 Will deploy image: $FULL_IMAGE_REF"
+        fi
+        
+        rm version_info.json

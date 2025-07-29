@@ -1,0 +1,67 @@
+name: 'Upload Docker Image Version to Google Cloud Storage Bucket'
+description: 'A reusable action to upload docker image version to Google Cloud Storage Bucket using Workload Identity Federation'
+inputs:
+  workload-identity-provider:
+    description: 'The full identifier of the Workload Identity Provider, including the project number, pool name, and provider name'
+    required: true
+  service-account:
+    description: 'Email address of the Google Cloud Service Account to impersonate'
+    required: true
+  bucket-name:
+    description: 'Name of the Google Cloud Storage bucket to upload the image version information'
+    required: true
+  bucket-path:
+    description: 'Path within the Google Cloud Storage bucket where the image version information will be stored'
+    required: true
+  version:
+    description: 'The version of the Docker image to be uploaded'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        service_account: ${{ inputs.service-account }}
+        token_format: access_token
+        access_token_lifetime: 300s
+    
+    - name: Store Image Version in GCP Bucket
+      shell: bash
+      run: |
+        GCP_PROJECT=$(gcloud config get-value project)
+        echo "Using GCP project: $GCP_PROJECT"
+
+        BUCKET_NAME="${{ inputs.bucket-name }}"
+        BUCKET_PATH="${{ inputs.bucket-path }}"
+
+        cat > version_info.json << EOF
+        {
+          "version": "${{ inputs.version }}",
+          "commit": "${{ github.sha }}",
+          "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+          "workflow_id": "${{ github.run_id }}"
+        }
+        EOF
+        
+        if ! gcloud storage buckets describe gs://${BUCKET_NAME} --project=$GCP_PROJECT &>/dev/null; then
+          echo "🔄 Bucket does not exist. Creating bucket gs://${BUCKET_NAME} in project $GCP_PROJECT..."
+          
+          if ! gcloud storage buckets create gs://${BUCKET_NAME} \
+               --project=$GCP_PROJECT \
+               --location=us-east1 \
+               --uniform-bucket-level-access; then
+            echo "❌ Failed to create bucket gs://${BUCKET_NAME} in project $GCP_PROJECT"
+            exit 1
+          fi
+        fi
+  
+        echo "Uploading version info to bucket..."
+        if ! gcloud storage cp version_info.json gs://${BUCKET_NAME}/${BUCKET_PATH}/latest-version.json \
+             --project=$GCP_PROJECT; then
+          echo "❌ Failed to upload version info to bucket"
+          exit 1
+        fi
+        
+        echo "✅ Image version ${{ env.VERSION }} stored in bucket gs://${BUCKET_NAME} in project $GCP_PROJECT"

@@ -1,0 +1,72 @@
+name: 'Upload Secrets to Google Secret Manager'
+description: 'A reusable action to upload secrets to Google Secret Manager using Workload Identity Federation'
+inputs:
+  gcp-project-id:
+    description: 'Google Cloud Project ID'
+    required: true
+  encrypted-secrets-file:
+    description: 'Path to the GPG encrypted secrets file'
+    required: true
+    default: 'secrets.json.gpg'
+  gpg-passphrase:
+    description: 'Passphrase to decrypt the secrets file'
+    required: true
+  workload-identity-provider:
+    description: 'The full identifier of the Workload Identity Provider, including the project number, pool name, and provider name'
+    required: true
+  service-account:
+    description: 'Email address of the Google Cloud Service Account to impersonate'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v4
+    
+    # - name: Setup GPG
+    #   uses: crazy-max/ghaction-setup-gpg@v1
+
+    - name: Install GPG
+      shell: bash
+      run: |
+        echo "Installing GPG..."
+        sudo apt-get update
+        sudo apt-get install -y gnupg
+        gpg --version
+        echo "GPG installation completed"
+      
+    - name: Decrypt secrets file
+      shell: bash
+      run: |
+        echo "${{ inputs.gpg-passphrase }}" | gpg --batch --yes --passphrase-fd 0 \
+            --output ./decrypted_secrets.json --decrypt ${{ inputs.encrypted-secrets-file }}
+        echo "Decryption completed successfully"
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        workload_identity_provider: ${{ inputs.workload-identity-provider }}
+        service_account: ${{ inputs.service-account }}
+        token_format: access_token
+        access_token_lifetime: 300s
+    
+    - name: Setup Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+      with:
+        project_id: ${{ inputs.gcp-project-id }}
+    
+    - name: Upload secrets to GSM
+      shell: bash
+      env:
+        GCP_PROJECT_ID: ${{ inputs.gcp-project-id }}
+      run: |
+        python ${{ github.action_path }}/upload-gsm-secrets.py ./decrypted_secrets.json
+        
+    - name: Clean up decrypted file
+      if: always()
+      shell: bash
+      run: |
+        if [ -f "./decrypted_secrets.json" ]; then
+          rm ./decrypted_secrets.json
+          echo "Cleaned up decrypted secrets file"
+        fi
